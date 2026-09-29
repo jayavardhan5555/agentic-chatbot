@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph,START,END
-from langchain_core.messages import BaseMessage,HumanMessage
+from langchain_core.messages import BaseMessage,HumanMessage,SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph.message import add_messages
 from typing import Annotated,TypedDict
@@ -14,9 +14,75 @@ from typing import Any
 from langchain_tavily import TavilySearch
 from langgraph.prebuilt import ToolNode,tools_condition
 
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
 load_dotenv()
 
 llm = ChatOpenAI()
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+def ingest_document(filepath:str):
+    DB_PATH = "faiss_db"
+    loader = PyPDFLoader(filepath)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    vector_store = FAISS.from_documents(chunks,embeddings)
+    vector_store.save_local(DB_PATH)
+
+def get_retriver():
+    DB_PATH = "faiss_db"
+    vector_store = FAISS.load_local(
+        folder_path=DB_PATH,
+        embeddings=embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+    retriver = vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4}
+    )
+    return retriver
+
+@tool
+def rag_tool(query: str) -> str:
+    """
+    Retrieve relevant information from the PDF document.
+
+    Use this tool when the user asks factual or conceptual questions
+    that may be answered using the stored PDF documents.
+
+    Args:
+        query: The question or search query used to retrieve PDF content.
+    """
+
+    retriver = get_retriver()
+    docs = retriver.invoke(query)
+
+    if not docs:
+        "No information found in pdf file"
+
+    formatted_documents = []
+
+    for index,document in enumerate(docs,start=1):
+        source = document.metadata.get("source", "Unknown source")
+        page = document.metadata.get("page", "Unknown page")
+
+        formatted_documents.append(
+            f"Document {index}\n"
+            f"Source: {source}\n"
+            f"Page: {page}\n"
+            f"Content: {document.page_content}"
+        )
+
+    return "\n\n".join(formatted_documents)
+
+
+
 
 # Tavily Search Tool
 
@@ -177,7 +243,7 @@ def get_current_weather(location: str) -> str:
     except (KeyError, TypeError, ValueError) as error:
         return f"Unexpected weather API response: {error}"
 
-tools = [search_tool,calculator, get_stock_price,get_current_weather]
+tools = [search_tool,calculator, get_stock_price,get_current_weather,rag_tool]
 
 llm_with_tools = llm.bind_tools(tools)
 
@@ -185,8 +251,31 @@ class ChatState(TypedDict):
     messages : Annotated[list[BaseMessage],add_messages]
 
 def chat_node(state:ChatState):
+    """LLM node that can answer directly or call an appropriate tool."""
 
-    messages = state["messages"]
+    system_message = SystemMessage(
+        content=(
+            "You are a helpful Agentic Chatbot with access to several tools.\n\n"
+
+            "Tool usage instructions:\n"
+            "- Use `rag_tool` for questions about the uploaded PDF or document. "
+            "Always retrieve relevant document content before answering PDF-related questions.\n"
+            "- Use `search_tool` for current events, recent information, or information "
+            "that requires an internet search.\n"
+            "- Use `calculator` for mathematical calculations. Do not calculate complex "
+            "expressions manually when the calculator is available.\n"
+            "- Use `get_stock_price` when the user asks for the current price of a stock.\n"
+            "- Use `get_current_weather` when the user asks about current weather for a location.\n\n"
+
+            "Answer general questions directly when no tool is required. "
+            "Do not invent information from the uploaded document. "
+            "If the user asks about a PDF but no document is available, ask them to upload a PDF. "
+            "After receiving a tool result, provide a clear and helpful final answer."
+        )
+    )
+
+
+    messages = [system_message,*state["messages"]]
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
